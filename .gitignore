@@ -8,3 +8,5 @@ media/
 .superpowers/
 data/
 tsconfig.tsbuildinfo
+data.db-shm
+data.db-wal
