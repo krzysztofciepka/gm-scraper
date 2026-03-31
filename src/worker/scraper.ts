@@ -424,6 +424,48 @@ function extractDetailFromResponse(data: unknown): RawBusinessDetail | null {
 }
 
 // ---------------------------------------------------------------------------
+// Consent handling
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle Google's cookie consent page that appears on first visit in the EU.
+ * Clicks "Accept all" / "Zaakceptuj wszystko" if the consent page is shown.
+ */
+async function handleConsentPage(page: Page): Promise<void> {
+  const currentUrl = page.url();
+  if (!currentUrl.includes("consent.google")) return;
+
+  console.log("[consent] Consent page detected, accepting cookies...");
+
+  // Try multiple button selectors (different languages)
+  const selectors = [
+    'button:has-text("Accept all")',
+    'button:has-text("Zaakceptuj wszystko")',
+    'button:has-text("Akzeptieren")',
+    'button:has-text("Accepter tout")',
+    'button:has-text("Aceptar todo")',
+    // Form-based consent (some versions use a form)
+    'form[action*="consent"] button',
+  ];
+
+  for (const selector of selectors) {
+    try {
+      const btn = page.locator(selector).first();
+      if (await btn.isVisible({ timeout: 2000 })) {
+        await btn.click();
+        await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT }).catch(() => {});
+        console.log("[consent] Accepted cookies, URL now:", page.url());
+        return;
+      }
+    } catch {
+      // Try next selector
+    }
+  }
+
+  console.warn("[consent] Could not find consent button, trying to continue...");
+}
+
+// ---------------------------------------------------------------------------
 // Core scraping functions
 // ---------------------------------------------------------------------------
 
@@ -444,8 +486,11 @@ export async function geocodeCity(
   const encodedCity = encodeURIComponent(city);
   await page.goto(
     `https://www.google.com/maps/search/${encodedCity}`,
-    { waitUntil: "networkidle", timeout: NAV_TIMEOUT }
+    { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT }
   );
+
+  // Handle Google consent page (appears on first visit in EU)
+  await handleConsentPage(page);
 
   // Wait a moment for URL to settle after redirects
   await page.waitForTimeout(2000);
@@ -924,6 +969,17 @@ export async function scrapeCity(
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " +
         "Chrome/120.0.0.0 Safari/537.36",
     });
+
+    // Pre-set consent cookie to skip EU consent page
+    await context.addCookies([
+      {
+        name: "SOCS",
+        value: "CAESHAgCEhJnd3NfMjAyNDA1MTUtMF9SQzIaAmVuIAEaBgiA_LmzBg",
+        domain: ".google.com",
+        path: "/",
+      },
+    ]);
+
     const page = await context.newPage();
 
     // Block unnecessary resources to save bandwidth
