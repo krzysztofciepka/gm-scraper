@@ -7,3 +7,4 @@ media/
 !src/app/api/media/
 .superpowers/
 data/
+tsconfig.tsbuildinfo

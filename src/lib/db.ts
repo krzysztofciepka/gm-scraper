@@ -23,10 +23,14 @@ export function closeDb(): void {
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
 export function initSchema(path: string = "data.db"): void {
-  // Close any existing connection first (useful for tests)
+  // Already initialized — skip (unless it's a different path, e.g. tests with :memory:)
   if (_db) {
-    _db.close();
-    _db = null;
+    if (path === ":memory:") {
+      _db.close();
+      _db = null;
+    } else {
+      return;
+    }
   }
 
   _db = new Database(path);

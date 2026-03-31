@@ -1015,8 +1015,8 @@ export async function scrapeCity(
           continue;
         }
 
-        // Website filter — skip businesses without custom websites
-        if (!hasCustomWebsite(result.website)) {
+        // Website filter — skip businesses WITH custom websites (we want those WITHOUT)
+        if (hasCustomWebsite(result.website)) {
           businessesSkipped++;
           continue;
         }
