@@ -49,7 +49,7 @@ const DELAY_MIN = 2000;
 const DELAY_MAX = 5000;
 
 /** Timeout for navigation (ms). */
-const NAV_TIMEOUT = 30_000;
+const NAV_TIMEOUT = 60_000;
 
 /** Timeout for network intercept waiting (ms). */
 const INTERCEPT_TIMEOUT = 15_000;
@@ -466,6 +466,34 @@ async function handleConsentPage(page: Page): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// URL coordinate extraction
+// ---------------------------------------------------------------------------
+
+/**
+ * Poll the page URL until it contains @lat,lng,zoom coordinates.
+ * Google Maps SPA updates the URL asynchronously after initial load.
+ */
+async function waitForUrlCoords(
+  page: Page,
+  timeoutMs: number
+): Promise<{ lat: number; lng: number; zoom: number } | null> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const url = page.url();
+    const match = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+),(\d+\.?\d*)z/);
+    if (match) {
+      return {
+        lat: parseFloat(match[1]),
+        lng: parseFloat(match[2]),
+        zoom: parseFloat(match[3]),
+      };
+    }
+    await page.waitForTimeout(500);
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Core scraping functions
 // ---------------------------------------------------------------------------
 
@@ -492,20 +520,15 @@ export async function geocodeCity(
   // Handle Google consent page (appears on first visit in EU)
   await handleConsentPage(page);
 
-  // Wait a moment for URL to settle after redirects
-  await page.waitForTimeout(2000);
+  // Wait for URL to contain @ coordinates (Google Maps SPA updates URL async)
+  const coordsUrl = await waitForUrlCoords(page, 15000);
+  if (coordsUrl) {
+    console.log(`[geocode] Got coords from URL: ${coordsUrl.lat}, ${coordsUrl.lng}, zoom ${coordsUrl.zoom}`);
+    return boundsFromCenter(coordsUrl.lat, coordsUrl.lng, coordsUrl.zoom);
+  }
 
   const url = page.url();
-  console.log(`[geocode] URL after navigation: ${url}`);
-
-  // Try to extract @lat,lng,zoom from URL
-  const atMatch = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+),(\d+\.?\d*)z/);
-  if (atMatch) {
-    const lat = parseFloat(atMatch[1]);
-    const lng = parseFloat(atMatch[2]);
-    const zoom = parseFloat(atMatch[3]);
-    return boundsFromCenter(lat, lng, zoom);
-  }
+  console.log(`[geocode] URL after waiting: ${url}`);
 
   // Fallback: try viewport parameters in URL
   const viewportMatch = url.match(
@@ -514,12 +537,12 @@ export async function geocodeCity(
   if (viewportMatch) {
     const lat = parseFloat(viewportMatch[1]);
     const lng = parseFloat(viewportMatch[2]);
-    // Default to zoom ~13 for city-level view
     return boundsFromCenter(lat, lng, 13);
   }
 
   // Last resort: try to extract from the page's JavaScript state
   const coords = await page.evaluate(() => {
+    // Try meta tags
     const meta = document.querySelector('meta[content*="POINT"]');
     if (meta) {
       const match = meta
@@ -527,6 +550,15 @@ export async function geocodeCity(
         ?.match(/(-?\d+\.\d+)\s+(-?\d+\.\d+)/);
       if (match) {
         return { lat: parseFloat(match[2]), lng: parseFloat(match[1]) };
+      }
+    }
+    // Try og:image or other meta with coords
+    const ogImage = document.querySelector('meta[property="og:image"]');
+    if (ogImage) {
+      const content = ogImage.getAttribute("content") ?? "";
+      const match = content.match(/center=(-?\d+\.\d+)%2C(-?\d+\.\d+)/);
+      if (match) {
+        return { lat: parseFloat(match[1]), lng: parseFloat(match[2]) };
       }
     }
     return null;
@@ -1028,7 +1060,15 @@ export async function scrapeCity(
       );
 
       // Search for businesses in this cell
-      const searchResults = await searchCell(page, cell.bounds, searchQuery);
+      let searchResults: RawSearchResult[];
+      try {
+        searchResults = await searchCell(page, cell.bounds, searchQuery);
+      } catch (err) {
+        console.error(`[scrapeCity] Cell ${cell.index} search failed, skipping:`, (err as Error).message);
+        cellsCompleted++;
+        callbacks.onProgress({ grid_cells_total: totalCells, grid_cells_completed: cellsCompleted, businesses_found: businessesFound, businesses_skipped: businessesSkipped });
+        return;
+      }
       console.log(
         `[scrapeCity] Cell ${cell.index}: found ${searchResults.length} results`
       );
