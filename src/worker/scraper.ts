@@ -115,132 +115,108 @@ function isCoord(val: unknown): boolean {
 }
 
 /**
- * Attempt to extract search result entries from a Google Maps nested array
- * response. This is heuristic — we look for arrays containing a ChIJ place ID
- * near the start and coordinate pairs.
+ * Extract search result entries from a Google Maps response.
+ *
+ * Google Maps search responses have this structure:
+ *   data[64] = array of result groups (first 2 are metadata, rest are results)
+ *   data[64][i][1] = place data array with known field indices:
+ *     [11]  = name
+ *     [78]  = ChIJ place ID
+ *     [9][2], [9][3] = lat, lng
+ *     [4][7] = rating
+ *     [13][0] = primary category
+ *     [2] = address parts array
+ *     [18] = full formatted address
+ *     [7][0] = website URL
+ *     [7][1] = website domain
+ *     [178][0][0] = local phone
+ *     [178][0][1][1][0] = international phone
  */
 function extractSearchEntries(data: unknown): RawSearchResult[] {
   const results: RawSearchResult[] = [];
   const seen = new Set<string>();
 
-  // Google Maps search results are typically nested at a predictable depth.
-  // Each entry is an array where certain indices hold known fields.
-  const candidates = walkNestedArray(data, (item) => {
-    if (!Array.isArray(item) || item.length < 10) return false;
-    // Look for an entry that has a place ID string (ChIJ...)
-    return item.some(isPlaceId);
-  });
+  if (!Array.isArray(data)) return results;
 
-  for (const candidate of candidates) {
-    if (!Array.isArray(candidate)) continue;
-    const flat = flattenForSearch(candidate);
-    if (!flat) continue;
-    if (seen.has(flat.place_id)) continue;
-    seen.add(flat.place_id);
-    results.push(flat);
+  // Try the known structure: data[64][i][1]
+  const resultGroups = safeGet(data, 64) as unknown[] | null;
+  if (Array.isArray(resultGroups)) {
+    for (let i = 0; i < resultGroups.length; i++) {
+      const group = resultGroups[i];
+      if (!Array.isArray(group)) continue;
+      const place = group[1];
+      if (!Array.isArray(place) || place.length < 20) continue;
+
+      const result = extractPlaceFromKnownIndices(place);
+      if (result && !seen.has(result.place_id)) {
+        seen.add(result.place_id);
+        results.push(result);
+      }
+    }
+  }
+
+  if (results.length > 0) return results;
+
+  // If known structure didn't work, fall back to heuristic search
+  if (results.length === 0) {
+    const candidates = walkNestedArray(data, (item) => {
+      if (!Array.isArray(item) || item.length < 20) return false;
+      // Check for known field: [11] is a string (name) and [78] starts with ChIJ
+      return typeof safeGet(item, 11) === "string" && isPlaceId(safeGet(item, 78));
+    });
+
+    for (const candidate of candidates) {
+      if (!Array.isArray(candidate)) continue;
+      const result = extractPlaceFromKnownIndices(candidate);
+      if (result && !seen.has(result.place_id)) {
+        seen.add(result.place_id);
+        results.push(result);
+      }
+    }
   }
 
   return results;
 }
 
+function safeGet(arr: unknown, index: number): unknown {
+  if (Array.isArray(arr) && index < arr.length) return arr[index];
+  return null;
+}
+
 /**
- * Try to flatten a single candidate array into a RawSearchResult.
- * Returns null if essential fields cannot be found.
+ * Extract a RawSearchResult from a place data array using known field indices.
  */
-function flattenForSearch(arr: unknown[]): RawSearchResult | null {
-  let placeId: string | null = null;
-  let name: string | null = null;
-  let lat: number | null = null;
-  let lng: number | null = null;
-  let address = "";
-  let category = "";
-  let rating: number | null = null;
-  let reviewsCount = 0;
-  let website: string | null = null;
+function extractPlaceFromKnownIndices(place: unknown[]): RawSearchResult | null {
+  const name = safeGet(place, 11);
+  const placeId = safeGet(place, 78);
 
-  // Walk through to find place_id
-  walkNestedArray(arr, (item) => {
-    if (Array.isArray(item)) {
-      for (const el of item) {
-        if (isPlaceId(el) && !placeId) placeId = el;
-      }
-    }
-    return false;
-  });
+  if (typeof name !== "string" || !name) return null;
+  if (typeof placeId !== "string" || !placeId.startsWith("ChIJ")) return null;
 
-  if (!placeId) return null;
+  const coords = safeGet(place, 9) as unknown[] | null;
+  const lat = coords ? (safeGet(coords, 2) as number) ?? 0 : 0;
+  const lng = coords ? (safeGet(coords, 3) as number) ?? 0 : 0;
 
-  // Collect strings and numbers for heuristic assignment
-  const strings: string[] = [];
-  const numbers: number[] = [];
-  const coordPairs: [number, number][] = [];
+  const ratingArr = safeGet(place, 4) as unknown[] | null;
+  const rating = ratingArr ? (safeGet(ratingArr, 7) as number) ?? null : null;
 
-  walkNestedArray(
-    arr,
-    (item) => {
-      if (Array.isArray(item) && item.length === 2) {
-        if (isCoord(item[0]) && isCoord(item[1])) {
-          coordPairs.push([item[0] as number, item[1] as number]);
-        }
-      }
-      return false;
-    },
-    6
-  );
+  const categoryArr = safeGet(place, 13) as unknown[] | null;
+  const category = categoryArr ? (safeGet(categoryArr, 0) as string) ?? "" : "";
 
-  collectPrimitives(arr, strings, numbers, 0, 4);
+  const fullAddress = (safeGet(place, 18) as string) ?? "";
 
-  // Coordinates: the first pair is usually lat/lng
-  if (coordPairs.length > 0) {
-    const [a, b] = coordPairs[0];
-    // Google Maps uses lat, lng — lat is typically -90..90, lng -180..180
-    if (Math.abs(a) <= 90) {
-      lat = a;
-      lng = b;
-    } else if (Math.abs(b) <= 90) {
-      lat = b;
-      lng = a;
-    }
-  }
-
-  // Name: first non-empty string that isn't the place_id and doesn't look like an address
-  for (const s of strings) {
-    if (s === placeId) continue;
-    if (s.length < 2 || s.length > 200) continue;
-    if (/^https?:\/\//.test(s)) {
-      if (!website) website = s;
-      continue;
-    }
-    if (!name && !s.includes(",") && s.length <= 100) {
-      name = s;
-    } else if (!address && s.includes(",")) {
-      address = s;
-    } else if (!category && s.length < 60 && !s.includes(",")) {
-      // second short string without comma is likely category
-      if (name) category = s;
-    }
-  }
-
-  // Rating: look for a number between 1 and 5
-  for (const n of numbers) {
-    if (n >= 1 && n <= 5 && rating === null) {
-      rating = n;
-    } else if (n > 0 && n === Math.floor(n) && n < 100_000 && reviewsCount === 0) {
-      reviewsCount = n;
-    }
-  }
-
-  if (!name) return null;
+  const websiteArr = safeGet(place, 7) as unknown[] | null;
+  const website = websiteArr ? (safeGet(websiteArr, 0) as string) ?? null : null;
 
   return {
     place_id: placeId,
     name,
-    latitude: lat ?? 0,
-    longitude: lng ?? 0,
-    address,
+    latitude: typeof lat === "number" ? lat : 0,
+    longitude: typeof lng === "number" ? lng : 0,
+    address: fullAddress,
     category,
-    rating,
-    reviews_count: reviewsCount,
+    rating: typeof rating === "number" ? rating : null,
+    reviews_count: 0,
     website,
   };
 }
